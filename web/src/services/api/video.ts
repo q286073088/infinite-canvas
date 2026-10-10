@@ -6,6 +6,7 @@ import { dataUrlToFile, readFileAsDataUrl } from "@/lib/image-utils";
 import { clampVideoSeconds, computeVideoSize, inferVideoRatio } from "@/lib/media-size";
 import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
+import { compressGrokReferenceImages } from "./video-reference-images";
 import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { runModelPlugin } from "./model-plugin";
 import type { ReferenceImage } from "@/types/image";
@@ -93,7 +94,9 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
 async function createPluginVideoTask(config: AiConfig, model: string, script: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
     if (!config.baseUrl.trim()) throw new Error(apiText("baseUrlRequired"));
     if (!config.apiKey.trim()) throw new Error(apiText("apiKeyRequired"));
-    const refs = await Promise.all(references.map((image) => imageToDataUrl(image)));
+    const refs = /^grok-imagine-video(?:-|$)/.test(config.model)
+        ? await compressGrokReferenceImages(references, options?.signal)
+        : await Promise.all(references.map((image) => imageToDataUrl(image)));
     const videos = await Promise.all((options?.videos || []).map((video) => referenceMediaToFile(video, "ref.mp4", "invalidReferenceVideo", options)));
     const audios = await Promise.all((options?.audios || []).map((audio) => referenceMediaToFile(audio, "ref.mp3", "invalidReferenceAudio", options)));
     const result = videoPluginResult(
@@ -147,27 +150,48 @@ export async function storeGeneratedVideo(result: VideoGenerationResult): Promis
 }
 
 async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
-    const images = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
-    const videos = await Promise.all((options?.videos || []).map((video) => referenceMediaToFile(video, "ref.mp4", "invalidReferenceVideo", options)));
-    const audios = await Promise.all((options?.audios || []).map((audio) => referenceMediaToFile(audio, "ref.mp3", "invalidReferenceAudio", options)));
-    const mode = resolveVideoMode(config.videoMode, images.length);
-    const body = new FormData();
-    body.append("model", modelOptionName(model));
-    body.append("prompt", prompt);
-    body.append("seconds", normalizeVideoSeconds(config.videoSeconds));
-    body.append("size", normalizeVideoSize(config.size, config.vquality) || "1280x720");
-    body.append("resolution_name", normalizeVideoResolution(config.vquality));
-    body.append("generate_audio", String(boolConfig(config.videoGenerateAudio, true)));
-    body.append("watermark", String(boolConfig(config.videoWatermark, false)));
-    body.append("mode", mode);
-    if (mode === "frames") {
-        if (images[0]) body.append("first_frame", images[0], "first.png");
-        if (images[1]) body.append("last_frame", images[1], "last.png");
+    const mode = resolveVideoMode(config.videoMode, references.length);
+    let body: FormData | Record<string, unknown>;
+    if (/^grok-imagine-video(?:-|$)/.test(config.model)) {
+        if (options?.videos?.length) throw new Error(apiText("grokReferenceVideoUnsupported"));
+        const images = await compressGrokReferenceImages(references, options?.signal);
+        const audios = await Promise.all((options?.audios || []).map(async (audio) => ({ url: await readFileAsDataUrl(await referenceMediaToFile(audio, "ref.mp3", "invalidReferenceAudio", options)) })));
+        // New API's xAI plugin accepts JSON for first/last frames and multiple references.
+        body = {
+            model: config.model,
+            prompt,
+            seconds: Number(normalizeVideoSeconds(config.videoSeconds)),
+            size: normalizeVideoSize(config.size, config.vquality) || "1280x720",
+            resolution: normalizeVideoResolution(config.vquality),
+            generate_audio: boolConfig(config.videoGenerateAudio, true),
+            ...(mode === "frames"
+                ? { ...(images[0] && { image: { url: images[0] } }), ...(images[1] && { last_frame: { url: images[1] } }) }
+                : { reference_images: images.map((url) => ({ url })) }),
+            ...(audios.length && { reference_audios: audios }),
+        };
     } else {
-        images.forEach((file) => body.append("image[]", file, "ref.png"));
+        const images = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
+        const videos = await Promise.all((options?.videos || []).map((video) => referenceMediaToFile(video, "ref.mp4", "invalidReferenceVideo", options)));
+        const audios = await Promise.all((options?.audios || []).map((audio) => referenceMediaToFile(audio, "ref.mp3", "invalidReferenceAudio", options)));
+        const form = new FormData();
+        form.append("model", modelOptionName(model));
+        form.append("prompt", prompt);
+        form.append("seconds", normalizeVideoSeconds(config.videoSeconds));
+        form.append("size", normalizeVideoSize(config.size, config.vquality) || "1280x720");
+        form.append("resolution_name", normalizeVideoResolution(config.vquality));
+        form.append("generate_audio", String(boolConfig(config.videoGenerateAudio, true)));
+        form.append("watermark", String(boolConfig(config.videoWatermark, false)));
+        form.append("mode", mode);
+        if (mode === "frames") {
+            if (images[0]) form.append("first_frame", images[0], "first.png");
+            if (images[1]) form.append("last_frame", images[1], "last.png");
+        } else {
+            images.forEach((file) => form.append("image[]", file, "ref.png"));
+        }
+        videos.forEach((file) => form.append("video[]", file));
+        audios.forEach((file) => form.append("audio[]", file));
+        body = form;
     }
-    videos.forEach((file) => body.append("video[]", file));
-    audios.forEach((file) => body.append("audio[]", file));
     try {
         const created = unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos"), body, { headers: aiHeaders(config), signal: options?.signal })).data);
         if (!created.id) throw new Error(apiText("noVideoTaskId"));

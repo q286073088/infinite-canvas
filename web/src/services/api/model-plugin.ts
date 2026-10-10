@@ -438,7 +438,8 @@ return await generateImage({
         {
             label: i18n.t("modelPlugin.templates.openai"),
             script: `/**
- * OpenAI-compatible video: POST /v1/videos (multipart), then poll GET /v1/videos/{id}.
+ * OpenAI-compatible video: POST /v1/videos, then poll GET /v1/videos/{id}.
+ * Grok via New API uses JSON with compressed image data URLs; other models use multipart.
  * Do not set Content-Type on FormData; the browser adds the boundary.
  * @param {string} prompt
  * @param {string[]} images - reference images as data URLs
@@ -477,32 +478,57 @@ async function generateVideo({
   request,
   poll,
 }) {
-  const form = new FormData();
-  form.set("model", model);
-  form.set("prompt", prompt);
-  form.set("seconds", String(seconds || 8));
-  form.set("size", String(size || "1280x720"));
-  form.set("resolution_name", String(resolution || "720p"));
-  form.set("generate_audio", String(generateAudio !== false));
-  form.set("watermark", String(watermark === true));
-  form.set("mode", mode);
-  if (mode === "frames") {
-    if (images[0]) {
-      form.append("first_frame", await (await fetch(images[0])).blob(), "first.png");
-    }
-    if (images[1]) {
-      form.append("last_frame", await (await fetch(images[1])).blob(), "last.png");
-    }
+  let body;
+  if (/^grok-imagine-video(?:-|$)/.test(model)) {
+    if (videos.length) throw new Error("${i18n.t("apiErrors.grokReferenceVideoUnsupported")}");
+    const referenceAudios = await Promise.all(audios.map((file) => new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve({ url: reader.result });
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    })));
+    const referenceMode = mode === "reference" || images.length > 2;
+    body = {
+      model,
+      prompt,
+      seconds: Number(seconds || 8),
+      size: size || "1280x720",
+      resolution: resolution || "720p",
+      generate_audio: generateAudio !== false,
+      ...(referenceMode
+        ? { reference_images: images.map((url) => ({ url })) }
+        : { ...(images[0] && { image: { url: images[0] } }), ...(images[1] && { last_frame: { url: images[1] } }) }),
+      ...(referenceAudios.length && { reference_audios: referenceAudios }),
+    };
   } else {
-    for (const dataUrl of images) {
-      form.append("image[]", await (await fetch(dataUrl)).blob(), "ref.png");
+    const form = new FormData();
+    form.set("model", model);
+    form.set("prompt", prompt);
+    form.set("seconds", String(seconds || 8));
+    form.set("size", String(size || "1280x720"));
+    form.set("resolution_name", String(resolution || "720p"));
+    form.set("generate_audio", String(generateAudio !== false));
+    form.set("watermark", String(watermark === true));
+    form.set("mode", mode);
+    if (mode === "frames") {
+      if (images[0]) {
+        form.append("first_frame", await (await fetch(images[0])).blob(), "first.png");
+      }
+      if (images[1]) {
+        form.append("last_frame", await (await fetch(images[1])).blob(), "last.png");
+      }
+    } else {
+      for (const dataUrl of images) {
+        form.append("image[]", await (await fetch(dataUrl)).blob(), "ref.png");
+      }
     }
-  }
-  for (const file of videos) {
-    form.append("video[]", file);
-  }
-  for (const file of audios) {
-    form.append("audio[]", file);
+    for (const file of videos) {
+      form.append("video[]", file);
+    }
+    for (const file of audios) {
+      form.append("audio[]", file);
+    }
+    body = form;
   }
 
   const headers = {
@@ -510,16 +536,16 @@ async function generateVideo({
   };
   const task = await request({
     method: "post",
-    url: \`\${baseUrl}/v1/videos\`,
+    url: "/videos",
     headers,
-    data: form,
+    data: body,
   });
 
   return await poll(
     async () => {
       const state = await request({
         method: "get",
-        url: \`\${baseUrl}/v1/videos/\${task.id}\`,
+        url: \`/videos/\${task.id}\`,
         headers,
       });
       if (state.status === "failed" || state.status === "cancelled") {
@@ -531,7 +557,7 @@ async function generateVideo({
       if (state.status === "completed") {
         return await request({
           method: "get",
-          url: \`\${baseUrl}/v1/videos/\${task.id}/content\`,
+          url: \`/videos/\${task.id}/content\`,
           headers,
           responseType: "blob",
         });
